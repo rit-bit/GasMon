@@ -5,4 +5,10 @@
         <TargetFramework>net5.0</TargetFramework>
     </PropertyGroup>
 
+    <ItemGroup>
+      <PackageReference Include="AWSSDK.S3" Version="3.7.5" />
+      <PackageReference Include="AWSSDK.SimpleNotificationService" Version="3.7.3.3" />
+      <PackageReference Include="AWSSDK.SQS" Version="3.7.2" />
+    </ItemGroup>
+
 </Project>
