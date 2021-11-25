@@ -32,28 +32,20 @@ namespace GasMon
         private static IAmazonSimpleNotificationService
             _snsClient = new AmazonSimpleNotificationServiceClient(); // Notification service
 
-        private static IList<Location> _trustedLocations;
-        private static List<GasMonEvent> _trustedEvents = new();
+        private static IList<Location> _trustedLocations = new List<Location>();
+        private static IList<GasMonEvent> _trustedEvents = new List<GasMonEvent>();
+        private static int _duplicatesDetected = 0;
+        private static int _errorCount = 0;
 
         public static void Main()
         {
             LoggingConfig.Init();
-            
+
             _trustedLocations = GetLocations();
-            
-            var queueUrl = "";
-            try
-            {
-                queueUrl = CreateQueue();
-            }
-            catch (AggregateException)
-            {
-                var queueUrlTask = _sqsClient.GetQueueUrlAsync(QueueName);
-                queueUrlTask.Wait();
-                queueUrl = queueUrlTask.Result.QueueUrl;
-            }
+            var queueUrl = GetOrCreateQueue();
 
             _snsClient.SubscribeQueueAsync(Arn, _sqsClient, queueUrl);
+            Log.Debug($"Queue subscribed to topic.");
 
             do
             {
@@ -64,14 +56,19 @@ namespace GasMon
                 if (msg.Messages.Count != 0)
                 {
                     ProcessMessage(msg.Messages[0]);
-                    var task = DeleteMessage(_sqsClient, msg.Messages[0], queueUrl);
-                    task.Wait();
+                    DeleteMessage(_sqsClient, msg.Messages[0], queueUrl)
+                        .Wait();
                 }
             } while (!Console.KeyAvailable);
+
+            OutputToFile()
+                .Wait();
 
             _sqsClient.DeleteQueueAsync(queueUrl);
             Console.WriteLine($"Queue: \"{QueueName}\" was deleted.");
             Console.WriteLine($"Events list contained {_trustedEvents.Count} messages.");
+            Console.WriteLine($"Eliminated {_duplicatesDetected} duplicates.");
+            Console.WriteLine($"Encountered {_errorCount} errors.");
         }
 
         private static IList<Location> GetLocations()
@@ -98,13 +95,21 @@ namespace GasMon
 
                 Log.Trace("Deserializing JSON");
                 var locations = JsonConvert.DeserializeObject<List<Location>>(json);
-                Log.Trace($"{locations.Count} locations parsed");
-                foreach (var location in locations)
+
+                if (locations == null)
                 {
-                    Log.Trace($"Location id: {location.id}");
+                    Log.Error("No trusted locations could be parsed.");
+                }
+                else
+                {
+                    Log.Trace($"{locations.Count} locations parsed");
+                    foreach (var location in locations)
+                    {
+                        Log.Trace($"Location id: {location.id}");
+                    }
                 }
 
-                return locations;
+                return locations ?? new List<Location>();
             }
             catch (AmazonS3Exception e)
             {
@@ -115,6 +120,21 @@ namespace GasMon
             {
                 Log.Error($"Unknown encountered on server. Message: '{e.Message}' when writing an object");
                 throw;
+            }
+        }
+
+        private static string GetOrCreateQueue()
+        {
+            try
+            {
+                return CreateQueue();
+            }
+            catch (AggregateException)
+            {
+                var queueUrlTask = _sqsClient.GetQueueUrlAsync(QueueName);
+                queueUrlTask.Wait();
+                Log.Debug($"Using queue {QueueName} found in the cloud.");
+                return queueUrlTask.Result.QueueUrl;
             }
         }
 
@@ -131,6 +151,7 @@ namespace GasMon
             });
             responseTask.Wait();
             var response = responseTask.Result;
+            Log.Debug($"Queue {QueueName} created.");
             return response.QueueUrl;
         }
 
@@ -148,17 +169,33 @@ namespace GasMon
 
         private static void ProcessMessage(Message message)
         {
-            Log.Trace($"Deserializing message body from JSON: {message.Body}");
-            var body = JsonConvert.DeserializeObject<GasMonBody>(message.Body);
-            if (body != null)
+            try
             {
-                var msg = JsonConvert.DeserializeObject<GasMonMessage>(body.Message);
-                if (msg != null && IsTrustedLocation(msg.locationId))
+                Log.Trace($"Deserializing message body from JSON: {message.Body}");
+                var body = JsonConvert.DeserializeObject<GasMonBody>(message.Body);
+                if (body != null)
                 {
-                    var gasMonEvent = new GasMonEvent(body, msg);
-                    _trustedEvents.Add(gasMonEvent);
-                    Log.Debug($"GasMonEvent recorded:\n{gasMonEvent}");
+                    var msg = JsonConvert.DeserializeObject<GasMonMessage>(body.Message);
+                    if (msg != null && IsTrustedLocation(msg.locationId))
+                    {
+                        var gasMonEvent = new GasMonEvent(body, msg);
+                        if (_trustedEvents.Contains(gasMonEvent))
+                        {
+                            Console.WriteLine("\n\n\n");
+                            Log.Error("DUPLICATE DETECTED");
+                            Console.WriteLine("\n\n\n");
+                            _duplicatesDetected++;
+                        }
+
+                        _trustedEvents.Add(gasMonEvent);
+                        Log.Debug($"GasMonEvent recorded:\n{gasMonEvent}");
+                    }
                 }
+            }
+            catch (JsonReaderException)
+            {
+                Log.Error($"Unable to deserialize message body: {message.Body}");
+                _errorCount++;
             }
         }
 
@@ -172,8 +209,35 @@ namespace GasMon
         private static async Task DeleteMessage(
             IAmazonSQS sqsClient, Message message, string qUrl)
         {
-            Console.WriteLine($"\nDeleting message {message.MessageId} from queue...");
+            Log.Trace($"Deleting message {message.MessageId} from queue...");
             await sqsClient.DeleteMessageAsync(qUrl, message.ReceiptHandle);
+        }
+
+        private static async Task OutputToFile()
+        {
+            /*
+        var query = petsList.GroupBy(
+        pet => Math.Floor(pet.Age),
+        pet => pet.Age,
+        (baseAge, ages) => new
+        {
+            Key = baseAge,
+            Count = ages.Count(),
+            Min = ages.Min(),
+            Max = ages.Max()
+        });
+             */
+            var sortedEvents = _trustedEvents
+                .GroupBy(ev => ev.Message.DateTimeStamp.ToString("g"));
+            var lines = new List<string> {"Time,Average value"};
+            foreach (var groups in sortedEvents.OrderBy(x => x.Key))
+            {
+                var average = groups.Average(g => g.Message.value);
+                var fields = new[] {groups.Key, $"{average}"};
+                lines.Add(string.Join(',', fields));
+            }
+
+            await File.WriteAllLinesAsync("MinuteAverages.csv", lines);
         }
     }
 }
