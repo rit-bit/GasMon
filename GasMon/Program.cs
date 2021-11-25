@@ -41,7 +41,7 @@ namespace GasMon
         {
             LoggingConfig.Init();
 
-            _trustedLocations = GetLocations();
+            _trustedLocations = GetTrustedLocations();
             var queueUrl = GetOrCreateQueue();
 
             _snsClient.SubscribeQueueAsync(Arn, _sqsClient, queueUrl);
@@ -49,29 +49,21 @@ namespace GasMon
 
             do
             {
-                var msgTask = GetMessage(_sqsClient, queueUrl, WaitTime);
-                msgTask.Wait();
-                var msg = msgTask.Result;
-
-                if (msg.Messages.Count != 0)
-                {
-                    ProcessMessage(msg.Messages[0]);
-                    DeleteMessage(_sqsClient, msg.Messages[0], queueUrl)
-                        .Wait();
-                }
+                ProcessQueue(queueUrl);
             } while (!Console.KeyAvailable);
+
+            _sqsClient.DeleteQueueAsync(queueUrl);
+            Console.WriteLine($"Queue: \"{QueueName}\" was deleted.");
 
             OutputToFile()
                 .Wait();
 
-            _sqsClient.DeleteQueueAsync(queueUrl);
-            Console.WriteLine($"Queue: \"{QueueName}\" was deleted.");
             Console.WriteLine($"Events list contained {_trustedEvents.Count} messages.");
             Console.WriteLine($"Eliminated {_duplicatesDetected} duplicates.");
             Console.WriteLine($"Encountered {_errorCount} errors.");
         }
 
-        private static IList<Location> GetLocations()
+        private static IList<Location> GetTrustedLocations()
         {
             Log.Trace("Preparing to start retrieval from AWS bucket");
             try
@@ -84,13 +76,11 @@ namespace GasMon
 
                 Log.Trace("Making request");
                 var responseTask = _s3Client.GetObjectAsync(request);
-                responseTask.Wait();
                 var response = responseTask.Result;
 
                 Log.Trace($"Response: {response}");
                 using var reader = new StreamReader(response.ResponseStream);
                 var jsonTask = reader.ReadToEndAsync();
-                jsonTask.Wait();
                 var json = jsonTask.Result;
 
                 Log.Trace("Deserializing JSON");
@@ -102,10 +92,10 @@ namespace GasMon
                 }
                 else
                 {
-                    Log.Trace($"{locations.Count} locations parsed");
+                    Log.Trace($"{locations.Count} trusted locations parsed");
                     foreach (var location in locations)
                     {
-                        Log.Trace($"Location id: {location.id}");
+                        Log.Trace($"Trusted location id: {location.id}");
                     }
                 }
 
@@ -132,7 +122,6 @@ namespace GasMon
             catch (AggregateException)
             {
                 var queueUrlTask = _sqsClient.GetQueueUrlAsync(QueueName);
-                queueUrlTask.Wait();
                 Log.Debug($"Using queue {QueueName} found in the cloud.");
                 return queueUrlTask.Result.QueueUrl;
             }
@@ -149,16 +138,27 @@ namespace GasMon
                 QueueName = QueueName,
                 Attributes = attributes
             });
-            responseTask.Wait();
             var response = responseTask.Result;
             Log.Debug($"Queue {QueueName} created.");
             return response.QueueUrl;
         }
 
-        private static async Task<ReceiveMessageResponse> GetMessage(
-            IAmazonSQS sqsClient, string qUrl, int waitTime = 0)
+        private static void ProcessQueue(string queueUrl)
         {
-            return await sqsClient.ReceiveMessageAsync(new ReceiveMessageRequest
+            var msgTask = GetMessage(queueUrl, WaitTime);
+            var msg = msgTask.Result;
+
+            if (msg.Messages.Count != 0)
+            {
+                ProcessMessage(msg.Messages[0]);
+                DeleteMessageFromQueue(msg.Messages[0], queueUrl)
+                    .Wait();
+            }
+        }
+
+        private static async Task<ReceiveMessageResponse> GetMessage(string qUrl, int waitTime = 0)
+        {
+            return await _sqsClient.ReceiveMessageAsync(new ReceiveMessageRequest
             {
                 QueueUrl = qUrl,
                 MaxNumberOfMessages = MaxMessages,
@@ -206,27 +206,14 @@ namespace GasMon
 
 
         // Method to delete a message from a queue
-        private static async Task DeleteMessage(
-            IAmazonSQS sqsClient, Message message, string qUrl)
+        private static async Task DeleteMessageFromQueue(Message message, string queueUrl)
         {
             Log.Trace($"Deleting message {message.MessageId} from queue...");
-            await sqsClient.DeleteMessageAsync(qUrl, message.ReceiptHandle);
+            await _sqsClient.DeleteMessageAsync(queueUrl, message.ReceiptHandle);
         }
 
         private static async Task OutputToFile()
         {
-            /*
-        var query = petsList.GroupBy(
-        pet => Math.Floor(pet.Age),
-        pet => pet.Age,
-        (baseAge, ages) => new
-        {
-            Key = baseAge,
-            Count = ages.Count(),
-            Min = ages.Min(),
-            Max = ages.Max()
-        });
-             */
             var sortedEvents = _trustedEvents
                 .GroupBy(ev => ev.Message.DateTimeStamp.ToString("g"));
             var lines = new List<string> {"Time,Average value"};
