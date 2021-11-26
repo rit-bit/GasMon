@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -19,10 +20,14 @@ namespace GasMon
 
         private const string BucketName = "eventprocessing-swapprentices20-locationss3bucket-qu0txg2hhzj2";
 
-        private const string Arn =
+        private const string Part1Arn =
             "arn:aws:sns:eu-west-1:552908040772:EventProcessing-SWApprentices2021-snsTopicSensorDataPart1-DF8ZTFFN636Z";
+        private const string Part2Arn =
+            "arn:aws:sns:eu-west-1:552908040772:EventProcessing-SWApprentices2021-snsTopicSensorDataPart2-H16WHVKMI6NT";
 
-        private const string QueueName = "Queue";
+        private const string Part1Locations = "locations.json";
+        private const string Part2Locations = "locations-part2.json";
+        private const string QueueName = "Queue1";
         private const int MaxMessages = 1;
         private const int WaitTime = 2;
 
@@ -41,15 +46,20 @@ namespace GasMon
         {
             LoggingConfig.Init();
 
-            _trustedLocations = GetTrustedLocations();
+            _trustedLocations = GetTrustedLocations(Part2Locations);
             var queueUrl = GetOrCreateQueue();
 
-            _snsClient.SubscribeQueueAsync(Arn, _sqsClient, queueUrl);
+            _snsClient.SubscribeQueueAsync(Part2Arn, _sqsClient, queueUrl);
             Log.Debug($"Queue subscribed to topic.");
 
+            var loopCount = 0;
             do
             {
                 ProcessQueue(queueUrl);
+                if (loopCount++ % 5 == 0)
+                {
+                    PrintQueueSize(queueUrl);
+                }
             } while (!Console.KeyAvailable);
 
             _sqsClient.DeleteQueueAsync(queueUrl);
@@ -63,7 +73,7 @@ namespace GasMon
             Console.WriteLine($"Encountered {_errorCount} errors.");
         }
 
-        private static IList<Location> GetTrustedLocations()
+        private static IList<Location> GetTrustedLocations(string locationsFilename)
         {
             Log.Trace("Preparing to start retrieval from AWS bucket");
             try
@@ -71,7 +81,7 @@ namespace GasMon
                 var request = new GetObjectRequest
                 {
                     BucketName = BucketName,
-                    Key = "locations.json"
+                    Key = locationsFilename
                 };
 
                 Log.Trace("Making request");
@@ -142,6 +152,14 @@ namespace GasMon
             Log.Debug($"Queue {QueueName} created.");
             return response.QueueUrl;
         }
+        
+        private static async Task PrintQueueSize(string queueUrl)
+        {
+            var attributes = new List<string>{ QueueAttributeName.ApproximateNumberOfMessages };
+            GetQueueAttributesResponse responseGetAtt =
+                await _sqsClient.GetQueueAttributesAsync(queueUrl, attributes);
+            Log.Debug($"Current queue size: {responseGetAtt.ApproximateNumberOfMessages}");
+        }
 
         private static void ProcessQueue(string queueUrl)
         {
@@ -181,14 +199,14 @@ namespace GasMon
                         var gasMonEvent = new GasMonEvent(body, msg);
                         if (_trustedEvents.Contains(gasMonEvent))
                         {
-                            Console.WriteLine("\n\n\n");
-                            Log.Error("DUPLICATE DETECTED");
-                            Console.WriteLine("\n\n\n");
+                            Log.Debug($"Duplicate message detected:\n{gasMonEvent}");
                             _duplicatesDetected++;
                         }
-
-                        _trustedEvents.Add(gasMonEvent);
-                        Log.Debug($"GasMonEvent recorded:\n{gasMonEvent}");
+                        else
+                        {
+                            _trustedEvents.Add(gasMonEvent);
+                            Log.Debug($"GasMonEvent recorded:\n{gasMonEvent}");
+                        }
                     }
                 }
             }
@@ -204,24 +222,65 @@ namespace GasMon
             return _trustedLocations.Any(trustedLocation => trustedLocation.id.Equals(locationId));
         }
 
-
-        // Method to delete a message from a queue
         private static async Task DeleteMessageFromQueue(Message message, string queueUrl)
         {
             Log.Trace($"Deleting message {message.MessageId} from queue...");
             await _sqsClient.DeleteMessageAsync(queueUrl, message.ReceiptHandle);
         }
 
-        private static async Task OutputToFile()
+        private static List<TimeReadingPair> GetTimesAndAveragesForLocation(string locationId)
         {
             var sortedEvents = _trustedEvents
+                .Where(ev => ev.Message.locationId == locationId)
                 .GroupBy(ev => ev.Message.DateTimeStamp.ToString("g"));
-            var lines = new List<string> {"Time,Average value"};
+            var lines = new List<TimeReadingPair>();
             foreach (var groups in sortedEvents.OrderBy(x => x.Key))
             {
                 var average = groups.Average(g => g.Message.value);
-                var fields = new[] {groups.Key, $"{average}"};
-                lines.Add(string.Join(',', fields));
+                var kv = new TimeReadingPair (groups.Key, average);
+                lines.Add(kv);
+            }
+
+            return lines;
+        }
+
+        private static async Task OutputToFile()
+        {
+            var locationsDictionary = new Dictionary<string, List<TimeReadingPair>>();
+            foreach (var trustedLocation in _trustedLocations)
+            {
+                var locationId = trustedLocation.id;
+                locationsDictionary[locationId] = GetTimesAndAveragesForLocation(locationId);
+            }
+
+            var timesSet = new List<string>();
+            foreach (var locationId in locationsDictionary.Keys)
+            {
+                var readings = locationsDictionary[locationId];
+                foreach (var timeReading in readings)
+                {
+                    var time = timeReading.Time;
+                    if (!timesSet.Contains(time))
+                    {
+                        timesSet.Add(time);
+                    }
+                }
+            }
+            
+            timesSet.Sort();
+            var header = "Date,"; 
+            header += string.Join(',', _trustedLocations.Select(l => l.id));
+            var lines = new List<string> {header};
+            foreach (var time in timesSet)
+            {
+                var line = new List<string> {$"{time}"};
+                foreach (var trustedLocation in _trustedLocations)
+                {
+                    var timeAndReading = locationsDictionary[trustedLocation.id].SingleOrDefault(kv => kv.Time == time); // TODO Fix this
+                    var reading = timeAndReading == null ? "," : $"{timeAndReading.Reading},";
+                    line.Add($"{reading}"); // TODO Check for missing values
+                }
+                lines.Add(string.Join(',', line));
             }
 
             await File.WriteAllLinesAsync("MinuteAverages.csv", lines);
