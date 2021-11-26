@@ -3,7 +3,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Text;
 using System.Threading.Tasks;
 using Amazon.S3;
 using Amazon.S3.Model;
@@ -42,7 +41,7 @@ namespace GasMon
         private static int _duplicatesDetected = 0;
         private static int _errorCount = 0;
 
-        public static void Main()
+        public static void Main() // TODO Needs optimising, does not keep up with speed of incoming messages (maybe just printing..?)
         {
             LoggingConfig.Init();
 
@@ -185,7 +184,7 @@ namespace GasMon
             });
         }
 
-        private static void ProcessMessage(Message message)
+        private static void ProcessMessage(Message message) 
         {
             try
             {
